@@ -1,9 +1,8 @@
-# =====================================================================================
-# FILE: app/core/audio_processor.py (UPDATED with subtitle logic)
-# =====================================================================================
+# app/core/audio_processor.py
 import time
 import logging
 from typing import Dict, Any
+from pathlib import Path
 from fastapi import UploadFile
 
 from app.core.chunker import AudioChunker
@@ -13,6 +12,7 @@ from app.services.audio_service import AudioService
 from app.services.subtitle_service import SubtitleService
 from app.utils.temp_manager import TempManager
 from app.utils.file_handler import FileHandler
+from app.utils.pdf_generator import PDFGenerator  # NEW IMPORT
 from app.utils.response_models import StandardResponse
 from app.utils.response_helpers import (
     raise_validation_error, 
@@ -27,20 +27,18 @@ class AudioProcessor:
     def __init__(self):
         self.chunker = AudioChunker()
         self.transcriber = Transcriber()
-        self.summarizer = SummarizerService()
-        self.audio_service = AudioService()
-        self.subtitle_service = SubtitleService()  # NEW
         self.temp_manager = TempManager()
         self.file_handler = FileHandler()
+        self.audio_service = AudioService()
+        self.pdf_generator = PDFGenerator() 
+        self.summarizer = SummarizerService()
+        self.subtitle_service = SubtitleService()
 
     async def process_audio_file(self, audio_file: UploadFile, summarizer_service: str = None) -> StandardResponse:
-        """Process uploaded audio file"""
         session_id = self.temp_manager.generate_session_id()
         start_time = time.time()
         
         try:
-            logger.info(f"Starting audio file processing for session: {session_id}")
-            
             # Validate audio file
             if not self.file_handler.validate_audio_file(audio_file.filename):
                 raise_validation_error(
@@ -66,12 +64,12 @@ class AudioProcessor:
             processing_stats = {
                 "total_time_seconds": round(time.time() - start_time, 2),
                 "file_size_mb": round(self.file_handler.get_file_size_mb(audio_path), 2),
-                "session_id": session_id
+                "session_id": session_id,
+                "processing_method": "audio_file_upload"
             }
             
-            logger.info(f"Successfully processed audio file: {audio_file.filename}")
-            
-            return StandardResponse(
+            # Build response
+            response = StandardResponse(
                 success=True,
                 message="Audio processing completed successfully",
                 data=result_data,
@@ -80,10 +78,32 @@ class AudioProcessor:
                     "processing_stats": processing_stats
                 }
             )
+            # generate PDF report
+            try:
+
+                pdf_path = await self.pdf_generator.generate_summary_report(response.dict(), session_id)
+                pdf_filename = Path(pdf_path).name
+                
+                # Add PDF info to response
+                response.meta["pdf_report"] = {
+                    "filename": pdf_filename,
+                    "download_url": f"/api/v1/reports/download/{pdf_filename}",
+                    "file_path": pdf_path
+                }
+
+                
+            except Exception as pdf_error:
+                logger.error(f"PDF generation failed: {pdf_error}")
+                response.meta["pdf_report"] = {
+                    "error": "PDF generation failed",
+                    "details": str(pdf_error)
+                }
+            
+            return response
 
         except Exception as e:
             logger.error(f"Audio processing failed for session {session_id}: {e}")
-            if hasattr(e, 'status_code'):  # HTTPException
+            if hasattr(e, 'status_code'): 
                 raise
             raise_internal_server_error("Audio processing failed", str(e))
 
@@ -91,7 +111,6 @@ class AudioProcessor:
             self.temp_manager.cleanup_session(session_id)
 
     async def process_audio_from_url(self, video_url: str, summarizer_service: str = None) -> StandardResponse:
-        """Process audio extracted directly from video URL with subtitle optimization"""
         session_id = self.temp_manager.generate_session_id()
         start_time = time.time()
         
@@ -105,22 +124,12 @@ class AudioProcessor:
                     "URL must start with http:// or https://"
                 )
             
-            # ====================================================================
-            # STEP 1: CHECK FOR SUBTITLES FIRST (NEW OPTIMIZATION)
-            # ====================================================================
-            logger.info("Checking for existing subtitles...")
             subtitle_result = await self.subtitle_service.check_and_extract_subtitles(video_url)
             
             if subtitle_result.get("has_subtitles"):
-                logger.info("🎯 FOUND SUBTITLES! Using subtitle-only processing (cost-optimized)")
                 return await self._process_subtitle_only(
                     subtitle_result, video_url, session_id, start_time, summarizer_service
                 )
-            
-            # ====================================================================
-            # STEP 2: FALLBACK TO AUDIO PROCESSING (if no subtitles)
-            # ====================================================================
-            logger.info("⚠️ No subtitles found. Falling back to audio transcription...")
             
             # Validate video URL and constraints
             video_info = await self.audio_service.validate_video_url(video_url)
@@ -150,9 +159,8 @@ class AudioProcessor:
                 "processing_method": "audio_transcription"
             }
             
-            logger.info(f"Successfully processed audio from URL: {video_url}")
-            
-            return StandardResponse(
+            # Build response
+            response = StandardResponse(
                 success=True,
                 message="Video audio processing completed successfully",
                 data=result_data,
@@ -166,6 +174,29 @@ class AudioProcessor:
                     }
                 }
             )
+            
+            try:
+
+                pdf_path = await self.pdf_generator.generate_summary_report(response.dict(), session_id)
+                pdf_filename = Path(pdf_path).name
+                
+                # Add PDF info to response
+                response.meta["pdf_report"] = {
+                    "filename": pdf_filename,
+                    "download_url": f"/api/v1/reports/download/{pdf_filename}",
+                    "file_path": pdf_path
+                }
+
+                
+            except Exception as pdf_error:
+                logger.error(f"PDF generation failed: {pdf_error}")
+                response.meta["pdf_report"] = {
+                    "error": "PDF generation failed",
+                    "details": str(pdf_error)
+                }
+            
+            logger.info(f"Successfully processed audio from URL: {video_url}")
+            return response
 
         except Exception as e:
             logger.error(f"URL processing failed for session {session_id}: {e}")
@@ -177,13 +208,11 @@ class AudioProcessor:
             self.temp_manager.cleanup_session(session_id)
 
     async def _process_subtitle_only(self, subtitle_result: Dict, video_url: str, session_id: str, start_time: float, summarizer_service: str = None) -> StandardResponse:
-        """Process video using only subtitles (cost-optimized path)"""
         try:
             subtitle_text = subtitle_result["subtitle_text"]
             video_info = subtitle_result["video_info"]
             subtitle_source = subtitle_result["subtitle_source"]
             
-            logger.info(f"Processing {len(subtitle_text)} characters of subtitle text")
             
             # Validate subtitle content length
             if len(subtitle_text.strip()) < 50:
@@ -230,10 +259,8 @@ class AudioProcessor:
                 "subtitle_source": subtitle_source
             }
             
-            logger.info(f"💰 COST SAVINGS: Using subtitles saved Whisper transcription cost!")
-            logger.info(f"Total cost: ${total_cost:.6f} (Summary only)")
-            
-            return StandardResponse(
+            # Build response
+            response = StandardResponse(
                 success=True,
                 message="Video processing completed using existing subtitles (cost-optimized)",
                 data=result_data,
@@ -253,11 +280,35 @@ class AudioProcessor:
                 }
             )
             
+
+            try:
+        
+                pdf_path = await self.pdf_generator.generate_summary_report(response.dict(), session_id)
+                pdf_filename = Path(pdf_path).name
+                
+                # Add PDF info to response
+                response.meta["pdf_report"] = {
+                    "filename": pdf_filename,
+                    "download_url": f"/api/v1/reports/download/{pdf_filename}",
+                    "file_path": pdf_path
+                }
+                logger.info(f"PDF report generated: {pdf_filename}")
+                
+            except Exception as pdf_error:
+                logger.error(f"PDF generation failed: {pdf_error}")
+                # Don't fail the whole request if PDF generation fails
+                response.meta["pdf_report"] = {
+                    "error": "PDF generation failed",
+                    "details": str(pdf_error)
+                }
+            
+
+            return response
+            
         except Exception as e:
             logger.error(f"Subtitle-only processing failed: {e}")
             # Don't raise error - let it fall back to audio processing
             raise Exception("Subtitle processing failed, falling back to audio")
-
 
     async def _process_audio_pipeline(self, audio_path: str, session_id: str, summarizer_service: str = None) -> tuple:
         """Core audio processing pipeline"""
@@ -316,9 +367,7 @@ class AudioProcessor:
                     "summary_cost": summary_cost
                 }
             }
-
-            logger.info(f"Total processing cost: Whisper=${whisper_cost:.6f} + Summary=${summary_cost:.6f} = ${total_cost:.6f}")
-
+            
             return result_data, token_usage
 
         except Exception as e:
