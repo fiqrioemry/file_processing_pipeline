@@ -1,7 +1,8 @@
-from pydantic import BaseModel
-from typing import Optional, List
+# app/utils/response_models.py
+from pydantic import BaseModel, Field
 from datetime import datetime
-
+from typing import Optional, Dict, Any
+    
 class ChunkInfo(BaseModel):
     chunk_id: int
     start_time: float
@@ -10,24 +11,16 @@ class ChunkInfo(BaseModel):
     transcript: str
     confidence: Optional[float] = None
 
-class ProcessingResponse(BaseModel):
+
+class StandardResponse(BaseModel):
     success: bool
     message: str
-    transcript: Optional[str] = None
-    summary: Optional[str] = None
-    chunks: Optional[List[ChunkInfo]] = None
-    processing_stats: Optional[dict] = None
-    timestamp: datetime = datetime.now()
-    error_details: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    meta: Optional[Dict[str, Any]] = None
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
-    timestamp: datetime = datetime.now()
-
-class ErrorResponse(BaseModel):
-    success: bool = False
-    error: str
-    details: Optional[str] = None
-    timestamp: datetime = datetime.now()
+    timestamp: datetime = Field(default_factory=datetime.now)
